@@ -1,0 +1,31 @@
+# Ignore build artifacts
+bin/
+*.h264
+*.log
+output*.h264
+quic-send
+quic-recv
+webrtc-send
+webrtc-recv
+
+# Ignore third_party (will be cloned fresh in container)
+third_party/
+
+# Ignore test files
+test*.sh
+*.bin
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore Docker files to prevent infinite loops
+Dockerfile
+docker-compose.yml
+.dockerignore

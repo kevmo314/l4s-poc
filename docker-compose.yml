@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  # QUIC receiver - listens for incoming video
+  quic-receiver:
+    build: .
+    container_name: l4s-quic-receiver
+    command: ["quic-recv", "--port", "5000", "--cert", "/app/certs/cert.pem", "--key", "/app/certs/key.pem", "-v"]
+    ports:
+      - "5000:5000/udp"
+    networks:
+      - l4s-net
+    # Output goes to stdout, can redirect: docker logs -f l4s-quic-receiver > output.h264
+
+  # QUIC sender - sends video to receiver
+  quic-sender:
+    build: .
+    container_name: l4s-quic-sender
+    depends_on:
+      - quic-receiver
+    command: >
+      sh -c "sleep 2 &&
+             ffmpeg -f lavfi -i testsrc=duration=5:size=320x240:rate=30 -c:v libx264 -preset ultrafast -f h264 pipe:1 2>/dev/null |
+             quic-send --addr quic-receiver:5000 -v"
+    networks:
+      - l4s-net
+
+  # WebRTC receiver - WHIP server
+  webrtc-receiver:
+    build: .
+    container_name: l4s-webrtc-receiver
+    command: ["webrtc-recv", "--http-addr", ":8080", "-v"]
+    ports:
+      - "8080:8080/tcp"
+    networks:
+      - l4s-net
+
+  # WebRTC sender - WHIP client
+  webrtc-sender:
+    build: .
+    container_name: l4s-webrtc-sender
+    depends_on:
+      - webrtc-receiver
+    command: >
+      sh -c "sleep 2 &&
+             ffmpeg -f lavfi -i testsrc=duration=5:size=320x240:rate=30 -c:v libx264 -preset ultrafast -f h264 pipe:1 2>/dev/null |
+             webrtc-send --whip-url http://webrtc-receiver:8080/whip -v"
+    networks:
+      - l4s-net
+
+networks:
+  l4s-net:
+    driver: bridge
