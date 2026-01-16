@@ -12,39 +12,18 @@ docker build -t l4s-benchmark .
 
 ### Native
 
-Requires building the third-party C libraries first:
+Requires git, cmake, make, go, openssl, and libssl-dev (or equivalent).
 
 ```bash
-# Clone and build picotls
-git clone https://github.com/pion/picotls third_party/picotls
-cd third_party/picotls && git submodule update --init
-cmake -B build && cmake --build build
-cd ../..
-
-# Clone and build picoquic (with Prague CC)
-git clone https://github.com/pion/picoquic third_party/picoquic
-cd third_party/picoquic
-cmake -B build -DPICOTLS_INCLUDE_DIR=../picotls/include \
-      -DPICOTLS_CORE_LIBRARY=../picotls/build/libpicotls-core.a \
-      -DPICOTLS_FUSION_LIBRARY=../picotls/build/libpicotls-fusion.a \
-      -DPICOTLS_OPENSSL_LIBRARY=../picotls/build/libpicotls-openssl.a
-cmake --build build
-cd ../..
-
-# Clone and build SCReAM
-git clone https://github.com/pion/scream third_party/scream
-cd third_party/scream/code/wrapper_lib
-cmake -B build && cmake --build build
-cd ../../../..
-
-# Build Go binaries
-CGO_ENABLED=1 go build -o bin/webrtc-send ./cmd/webrtc-send
-CGO_ENABLED=1 go build -o bin/webrtc-recv ./cmd/webrtc-recv
-CGO_ENABLED=1 go build -o bin/quic-send ./cmd/quic-send
-CGO_ENABLED=1 go build -o bin/quic-recv ./cmd/quic-recv
+./build-native.sh
 ```
 
-See `Dockerfile` for complete build steps including CGO flags.
+This script clones and builds:
+- [picotls](https://github.com/h2o/picotls) - TLS 1.3 library
+- [picoquic](https://github.com/private-octopus/picoquic) - QUIC with Prague congestion control
+- [SCReAM](https://github.com/EricssonResearch/scream) - Congestion control for real-time media
+
+Binaries are output to `bin/`. Self-signed certificates are generated in `certs/`.
 
 ## Usage
 

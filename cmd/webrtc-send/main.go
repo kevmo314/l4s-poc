@@ -25,6 +25,10 @@ func main() {
 	verbose := flag.Bool("v", false, "Verbose output")
 	framerate := flag.Int("fps", 30, "Frame rate for timestamp calculation")
 	dataChannelTimeout := flag.Duration("dc-timeout", 5*time.Second, "Timeout to wait for data channel after sending video")
+	nat1to1IP := flag.String("nat-1to1-ip", "", "Public IP for 1:1 NAT mapping (for Docker/NAT environments)")
+	turnServer := flag.String("turn-server", "", "TURN server URL (e.g., turn:turn.example.com:3478)")
+	turnUser := flag.String("turn-user", "", "TURN server username")
+	turnPass := flag.String("turn-pass", "", "TURN server password")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -52,17 +56,47 @@ func main() {
 		log.Fatalf("Failed to register interceptors: %v", err)
 	}
 
-	// Create API with media engine and interceptors
+	// Create setting engine for NAT configuration
+	se := webrtc.SettingEngine{}
+	if *nat1to1IP != "" {
+		se.SetNAT1To1IPs([]string{*nat1to1IP}, webrtc.ICECandidateTypeHost)
+		// Use port range that's typically allowed through firewalls
+		se.SetEphemeralUDPPortRange(10000, 60000)
+		if *verbose {
+			log.Printf("Configured NAT 1:1 mapping to %s with UDP ports 10000-60000", *nat1to1IP)
+		}
+	}
+
+	// Create API with media engine, interceptors, and settings
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(se),
 	)
 
-	// Create PeerConnection configuration
+	// Create PeerConnection configuration with ICE servers
+	iceServers := []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.l.google.com:19302"}},
+	}
+
+	// Add TURN server if configured
+	if *turnServer != "" {
+		turnICE := webrtc.ICEServer{
+			URLs: []string{*turnServer},
+		}
+		if *turnUser != "" {
+			turnICE.Username = *turnUser
+			turnICE.Credential = *turnPass
+			turnICE.CredentialType = webrtc.ICECredentialTypePassword
+		}
+		iceServers = append(iceServers, turnICE)
+		if *verbose {
+			log.Printf("Added TURN server: %s", *turnServer)
+		}
+	}
+
 	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
+		ICEServers: iceServers,
 	}
 
 	// Create PeerConnection
