@@ -132,8 +132,11 @@ func main() {
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			os.Stdout.Write(msg.Data)
-			atomic.AddInt64(&dataChannelBytesRecv, int64(len(msg.Data)))
-			atomic.AddInt64(&dataChannelMsgCount, 1)
+			newBytes := atomic.AddInt64(&dataChannelBytesRecv, int64(len(msg.Data)))
+			newCount := atomic.AddInt64(&dataChannelMsgCount, 1)
+			if *verbose && newCount%10 == 1 {
+				log.Printf("DataChannel recv: msg #%d, %d bytes (total: %d bytes)", newCount, len(msg.Data), newBytes)
+			}
 		})
 
 		dc.OnClose(func() {
