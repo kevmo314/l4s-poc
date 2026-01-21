@@ -1,5 +1,6 @@
 #include "picoquic_wrapper.h"
 #include "picoquic.h"
+#include "picoquic_internal.h"
 #include "picoquic_utils.h"
 #include "picosocks.h"
 #include "picoquic_packet_loop.h"
@@ -334,8 +335,6 @@ static int loop_callback(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_
 
     pq_context_t* ctx = (pq_context_t*)callback_ctx;
 
-    fprintf(stderr, "DEBUG: loop_callback mode=%d ctx=%p\n", cb_mode, (void*)ctx);
-
     if (!ctx) return 0;
 
     switch (cb_mode) {
@@ -468,6 +467,11 @@ int pq_listen(pq_context_t* ctx, uint16_t port) {
 
     fprintf(stderr, "DEBUG: pq_listen starting on port %d\n", port);
     ctx->listen_port = port;
+
+    // Enable datagram support on server BEFORE connections are established
+    // This ensures the server advertises datagram support in its transport parameters
+    ctx->quic->default_tp.max_datagram_frame_size = PICOQUIC_MAX_PACKET_SIZE;
+    fprintf(stderr, "DEBUG: Enabled default datagram support on server (max_datagram_frame_size=%d)\n", PICOQUIC_MAX_PACKET_SIZE);
 
     // Start the network thread
     picoquic_packet_loop_param_t param = {0};

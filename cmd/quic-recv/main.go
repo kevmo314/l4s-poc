@@ -4,7 +4,7 @@
 package main
 
 import (
-	"bufio"
+	"crypto/rand"
 	"encoding/binary"
 	"flag"
 	"io"
@@ -25,6 +25,7 @@ func main() {
 	certFile := flag.String("cert", "certs/cert.pem", "TLS certificate file")
 	keyFile := flag.String("key", "certs/key.pem", "TLS key file")
 	ccAlgo := flag.String("cc", "prague", "Congestion control algorithm (prague, bbr, cubic, newreno)")
+	dcBitrate := flag.Int("dc-bitrate", 100, "Data channel send bitrate in kbps (0 to disable)")
 	verbose := flag.Bool("v", false, "Verbose output to stderr")
 	flag.Parse()
 
@@ -98,9 +99,10 @@ func main() {
 	firstNALReceived := make(chan struct{})
 	var firstNALOnce sync.Once
 
-	// Start goroutine to read from stdin and send via datagrams (side channel)
+	// Start goroutine to send datagrams at consistent bitrate (side channel)
 	var datagramBytesSent int64
 	var datagramCount int64
+	datagramStop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -110,31 +112,45 @@ func main() {
 		// This ensures the stream is properly established first
 		<-firstNALReceived
 
-		stdinReader := bufio.NewReader(os.Stdin)
-		buf := make([]byte, 1200) // MTU-safe size
+		if *dcBitrate <= 0 {
+			if *verbose {
+				log.Println("Data channel bitrate is 0, not sending data")
+			}
+			return
+		}
+
+		// Send every 100ms (10 times per second)
+		interval := 100 * time.Millisecond
+		bytesPerInterval := (*dcBitrate * 1000 / 8) / 10 // kbps to bytes per 100ms
+
+		buf := make([]byte, bytesPerInterval)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		if *verbose {
+			log.Printf("Data channel sending %d bytes every %v (%d kbps)", bytesPerInterval, interval, *dcBitrate)
+		}
 
 		for {
-			n, err := stdinReader.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("Error reading stdin: %v", err)
+			select {
+			case <-datagramStop:
+				return
+			case <-ticker.C:
+				// Fill with random data
+				if _, err := rand.Read(buf); err != nil {
+					log.Printf("Error generating random data: %v", err)
+					return
 				}
-				break
-			}
-			if n > 0 {
-				if _, err := conn.WriteDatagram(buf[:n]); err != nil {
+
+				if _, err := conn.WriteDatagram(buf); err != nil {
 					if *verbose {
 						log.Printf("Error sending datagram: %v", err)
 					}
-					break
+					return
 				}
-				atomic.AddInt64(&datagramBytesSent, int64(n))
+				atomic.AddInt64(&datagramBytesSent, int64(len(buf)))
 				atomic.AddInt64(&datagramCount, 1)
 			}
-		}
-		if *verbose {
-			log.Printf("Stdin reader finished: sent %d datagrams, %d bytes",
-				atomic.LoadInt64(&datagramCount), atomic.LoadInt64(&datagramBytesSent))
 		}
 	}()
 
@@ -219,6 +235,10 @@ func main() {
 	firstNALOnce.Do(func() {
 		close(firstNALReceived)
 	})
+
+	// Stop the datagram sender
+	close(datagramStop)
+	wg.Wait()
 
 	elapsed := time.Since(startTime)
 	log.Printf("Finished: received %d NALs, %d bytes in %v", nalCount, totalBytes, elapsed)

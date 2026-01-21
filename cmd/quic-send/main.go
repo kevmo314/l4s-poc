@@ -85,13 +85,16 @@ func main() {
 	// Start goroutine to receive datagrams and write to stdout (data channel)
 	var datagramBytesRecv int64
 	var datagramCount int64
+	var datagramOpen int32
 	datagramDone := make(chan struct{})
+	datagramStartTime := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(datagramDone)
 		buf := make([]byte, 1500)
+		first := true
 
 		for {
 			n, err := conn.ReadDatagram(buf)
@@ -102,9 +105,44 @@ func main() {
 				break
 			}
 			if n > 0 {
+				if first {
+					atomic.StoreInt32(&datagramOpen, 1)
+					datagramStartTime = time.Now()
+					first = false
+					if *verbose {
+						log.Println("Data channel active (first datagram received)")
+					}
+				}
 				os.Stdout.Write(buf[:n])
 				atomic.AddInt64(&datagramBytesRecv, int64(n))
 				atomic.AddInt64(&datagramCount, 1)
+			}
+		}
+	}()
+
+	// Start data channel stats logger
+	statsStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		var lastBytes int64
+		for {
+			select {
+			case <-statsStop:
+				return
+			case <-ticker.C:
+				if atomic.LoadInt32(&datagramOpen) == 1 {
+					currentBytes := atomic.LoadInt64(&datagramBytesRecv)
+					currentCount := atomic.LoadInt64(&datagramCount)
+					elapsed := time.Since(datagramStartTime).Seconds()
+					instantBitrate := float64(currentBytes-lastBytes) * 8 / 1e3 // kbps in last second
+					avgBitrate := float64(currentBytes*8) / elapsed / 1e3       // kbps average
+					if *verbose {
+						log.Printf("DataChannel: %d msgs, %d bytes, instant=%.1f kbps, avg=%.1f kbps",
+							currentCount, currentBytes, instantBitrate, avgBitrate)
+					}
+					lastBytes = currentBytes
+				}
 			}
 		}
 	}()
@@ -162,6 +200,7 @@ func main() {
 		log.Println("Sent stream FIN")
 	}
 
+	close(statsStop)
 	elapsed := time.Since(startTime)
 	log.Printf("Finished: sent %d NALs, %d bytes in %v", nalCount, totalBytes, elapsed)
 
@@ -190,10 +229,12 @@ func main() {
 	dgCount := atomic.LoadInt64(&datagramCount)
 	if dgCount > 0 {
 		log.Printf("Data channel: received %d datagrams, %d bytes", dgCount, dgBytes)
-		totalElapsed := time.Since(startTime)
-		if totalElapsed.Seconds() > 0 {
-			dgBitrate := float64(dgBytes*8) / totalElapsed.Seconds() / 1e6
-			log.Printf("Data channel bitrate: %.2f Mbps", dgBitrate)
+		dcElapsed := time.Since(datagramStartTime)
+		if dcElapsed.Seconds() > 0 {
+			dgBitrate := float64(dgBytes*8) / dcElapsed.Seconds() / 1e3
+			log.Printf("Data channel bitrate: %.2f kbps", dgBitrate)
 		}
+	} else {
+		log.Printf("Data channel: no datagrams received")
 	}
 }

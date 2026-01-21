@@ -4,8 +4,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"crypto/rand"
 	"flag"
 	"io"
 	"log"
@@ -58,6 +58,7 @@ func main() {
 	httpAddr := flag.String("http-addr", ":8080", "HTTP address for WHIP endpoint")
 	whipPath := flag.String("whip-path", "/whip", "WHIP endpoint path")
 	nat1to1IP := flag.String("nat-1to1-ip", "", "Public IP for 1:1 NAT mapping (auto-detects GCP if empty)")
+	dcBitrate := flag.Int("dc-bitrate", 100, "DataChannel send bitrate in kbps (0 to disable)")
 	verbose := flag.Bool("v", false, "Verbose output")
 	flag.Parse()
 
@@ -173,35 +174,48 @@ func main() {
 
 		dc.OnOpen(func() {
 			if *verbose {
-				log.Println("DataChannel opened, starting stdin reader")
+				log.Println("DataChannel opened, starting data sender")
 			}
 
-			// Read from stdin and send via DataChannel
-			go func() {
-				stdinReader := bufio.NewReader(os.Stdin)
-				buf := make([]byte, 16384) // DataChannel can handle larger messages
+			if *dcBitrate <= 0 {
+				if *verbose {
+					log.Println("DataChannel bitrate is 0, not sending data")
+				}
+				return
+			}
 
-				for {
-					n, err := stdinReader.Read(buf)
-					if err != nil {
-						if err != io.EOF {
-							log.Printf("Error reading stdin: %v", err)
+			// Send random data at consistent bitrate
+			go func() {
+				// Send every 100ms (10 times per second)
+				interval := 100 * time.Millisecond
+				bytesPerInterval := (*dcBitrate * 1000 / 8) / 10 // kbps to bytes per 100ms
+
+				buf := make([]byte, bytesPerInterval)
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+
+				if *verbose {
+					log.Printf("DataChannel sending %d bytes every %v (%d kbps)", bytesPerInterval, interval, *dcBitrate)
+				}
+
+				for range ticker.C {
+					// Fill with random data
+					if _, err := rand.Read(buf); err != nil {
+						log.Printf("Error generating random data: %v", err)
+						break
+					}
+
+					if err := dc.Send(buf); err != nil {
+						if *verbose {
+							log.Printf("Error sending on DataChannel: %v", err)
 						}
 						break
 					}
-					if n > 0 {
-						if err := dc.Send(buf[:n]); err != nil {
-							if *verbose {
-								log.Printf("Error sending on DataChannel: %v", err)
-							}
-							break
-						}
-						atomic.AddInt64(&dataChannelBytesSent, int64(n))
-						atomic.AddInt64(&dataChannelMsgCount, 1)
-					}
+					atomic.AddInt64(&dataChannelBytesSent, int64(len(buf)))
+					atomic.AddInt64(&dataChannelMsgCount, 1)
 				}
 				if *verbose {
-					log.Printf("Stdin reader finished: sent %d messages, %d bytes",
+					log.Printf("Data sender finished: sent %d messages, %d bytes",
 						atomic.LoadInt64(&dataChannelMsgCount), atomic.LoadInt64(&dataChannelBytesSent))
 				}
 			}()

@@ -109,7 +109,9 @@ func main() {
 	// Track DataChannel stats
 	var dataChannelBytesRecv int64
 	var dataChannelMsgCount int64
+	var dataChannelOpen int32
 	dataChannelDone := make(chan struct{})
+	dataChannelStartTime := time.Now()
 
 	// Create a dummy DataChannel to enable SCTP transport in the offer
 	// This allows the receiver to create DataChannels that will be sent to us
@@ -124,6 +126,8 @@ func main() {
 
 		dc.OnOpen(func() {
 			log.Printf("DataChannel '%s' opened", dc.Label())
+			atomic.StoreInt32(&dataChannelOpen, 1)
+			dataChannelStartTime = time.Now()
 		})
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -282,6 +286,33 @@ func main() {
 		return
 	}
 
+	// Start datachannel stats logger
+	statsStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		var lastBytes int64
+		for {
+			select {
+			case <-statsStop:
+				return
+			case <-ticker.C:
+				if atomic.LoadInt32(&dataChannelOpen) == 1 {
+					currentBytes := atomic.LoadInt64(&dataChannelBytesRecv)
+					currentCount := atomic.LoadInt64(&dataChannelMsgCount)
+					elapsed := time.Since(dataChannelStartTime).Seconds()
+					instantBitrate := float64(currentBytes-lastBytes) * 8 / 1e3 // kbps in last second
+					avgBitrate := float64(currentBytes*8) / elapsed / 1e3       // kbps average
+					if *verbose {
+						log.Printf("DataChannel: %d msgs, %d bytes, instant=%.1f kbps, avg=%.1f kbps",
+							currentCount, currentBytes, instantBitrate, avgBitrate)
+					}
+					lastBytes = currentBytes
+				}
+			}
+		}
+	}()
+
 	// Read H264 NAL units from stdin and send them
 	reader := h264.NewAnnexBReader(os.Stdin)
 	packetizer := h264.NewRTPPacketizer(0x12345678, 1200)
@@ -340,6 +371,7 @@ func main() {
 	}
 
 finish:
+	close(statsStop)
 	elapsed := time.Since(startTime)
 	log.Printf("Finished: sent %d NALs, %d bytes in %v", nalCount, totalBytes, elapsed)
 	if totalBytes > 0 && elapsed.Seconds() > 0 {
@@ -367,10 +399,12 @@ finish:
 	dcCount := atomic.LoadInt64(&dataChannelMsgCount)
 	if dcCount > 0 {
 		log.Printf("Data channel: received %d messages, %d bytes", dcCount, dcBytes)
-		totalElapsed := time.Since(startTime)
-		if totalElapsed.Seconds() > 0 {
-			dcBitrate := float64(dcBytes*8) / totalElapsed.Seconds() / 1e6
-			log.Printf("Data channel bitrate: %.2f Mbps", dcBitrate)
+		dcElapsed := time.Since(dataChannelStartTime)
+		if dcElapsed.Seconds() > 0 {
+			dcBitrate := float64(dcBytes*8) / dcElapsed.Seconds() / 1e3
+			log.Printf("Data channel bitrate: %.2f kbps", dcBitrate)
 		}
+	} else {
+		log.Printf("Data channel: no messages received")
 	}
 }
