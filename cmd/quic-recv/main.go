@@ -4,8 +4,8 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
@@ -20,12 +20,22 @@ import (
 	"github.com/kevmo314/l4s/pkg/picoquic"
 )
 
+// BandwidthStats is sent over the datachannel to report receiver bandwidth
+type BandwidthStats struct {
+	Seq         uint64  `json:"seq"`     // Sequence number for loss/reorder detection
+	Timestamp   int64   `json:"ts"`      // Unix timestamp in ms (for latency measurement)
+	BytesRecv   int64   `json:"bytes"`   // Total bytes received
+	BitrateKbps float64 `json:"kbps"`    // Current bitrate in kbps
+	BitrateMbps float64 `json:"mbps"`    // Current bitrate in Mbps
+	NALCount    int     `json:"nals"`    // Total NALs received
+	ElapsedMs   int64   `json:"elapsed"` // Elapsed time in ms
+}
+
 func main() {
 	port := flag.Uint("port", 5000, "Port to listen on")
 	certFile := flag.String("cert", "certs/cert.pem", "TLS certificate file")
 	keyFile := flag.String("key", "certs/key.pem", "TLS key file")
 	ccAlgo := flag.String("cc", "prague", "Congestion control algorithm (prague, bbr, cubic, newreno)")
-	dcBitrate := flag.Int("dc-bitrate", 100, "Data channel send bitrate in kbps (0 to disable)")
 	verbose := flag.Bool("v", false, "Verbose output to stderr")
 	flag.Parse()
 
@@ -99,7 +109,12 @@ func main() {
 	firstNALReceived := make(chan struct{})
 	var firstNALOnce sync.Once
 
-	// Start goroutine to send datagrams at consistent bitrate (side channel)
+	// Stats variables (atomic for goroutine access)
+	var nalCountAtomic int64
+	var totalBytesAtomic int64
+	startTime := time.Now()
+
+	// Start goroutine to send bandwidth stats via datagrams (side channel)
 	var datagramBytesSent int64
 	var datagramCount int64
 	datagramStop := make(chan struct{})
@@ -112,23 +127,15 @@ func main() {
 		// This ensures the stream is properly established first
 		<-firstNALReceived
 
-		if *dcBitrate <= 0 {
-			if *verbose {
-				log.Println("Data channel bitrate is 0, not sending data")
-			}
-			return
-		}
-
-		// Send every 100ms (10 times per second)
-		interval := 100 * time.Millisecond
-		bytesPerInterval := (*dcBitrate * 1000 / 8) / 10 // kbps to bytes per 100ms
-
-		buf := make([]byte, bytesPerInterval)
+		// Send stats every 10ms for latency measurement
+		interval := 10 * time.Millisecond
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		var seq uint64
+
 		if *verbose {
-			log.Printf("Data channel sending %d bytes every %v (%d kbps)", bytesPerInterval, interval, *dcBitrate)
+			log.Printf("Data channel sending bandwidth stats every %v", interval)
 		}
 
 		for {
@@ -136,19 +143,41 @@ func main() {
 			case <-datagramStop:
 				return
 			case <-ticker.C:
-				// Fill with random data
-				if _, err := rand.Read(buf); err != nil {
-					log.Printf("Error generating random data: %v", err)
-					return
+				seq++
+
+				// Get current stats
+				currentBytes := atomic.LoadInt64(&totalBytesAtomic)
+				currentNALs := int(atomic.LoadInt64(&nalCountAtomic))
+				elapsed := time.Since(startTime)
+				elapsedMs := elapsed.Milliseconds()
+				var bitrateMbps float64
+				if elapsed.Seconds() > 0 {
+					bitrateMbps = float64(currentBytes*8) / elapsed.Seconds() / 1e6
 				}
 
-				if _, err := conn.WriteDatagram(buf); err != nil {
+				stats := BandwidthStats{
+					Seq:         seq,
+					Timestamp:   time.Now().UnixMilli(),
+					BytesRecv:   currentBytes,
+					BitrateKbps: bitrateMbps * 1000,
+					BitrateMbps: bitrateMbps,
+					NALCount:    currentNALs,
+					ElapsedMs:   elapsedMs,
+				}
+
+				data, err := json.Marshal(stats)
+				if err != nil {
+					log.Printf("Error marshaling stats: %v", err)
+					continue
+				}
+
+				if _, err := conn.WriteDatagram(data); err != nil {
 					if *verbose {
 						log.Printf("Error sending datagram: %v", err)
 					}
 					return
 				}
-				atomic.AddInt64(&datagramBytesSent, int64(len(buf)))
+				atomic.AddInt64(&datagramBytesSent, int64(len(data)))
 				atomic.AddInt64(&datagramCount, 1)
 			}
 		}
@@ -156,10 +185,6 @@ func main() {
 
 	// Create H264 Annex B writer for stdout
 	annexBWriter := h264.NewAnnexBWriter(os.Stdout)
-
-	nalCount := 0
-	totalBytes := int64(0)
-	startTime := time.Now()
 
 	// Read loop
 	lenBuf := make([]byte, 4)
@@ -214,20 +239,20 @@ func main() {
 			break
 		}
 
-		nalCount++
-		totalBytes += int64(nalLen)
+		newNALCount := atomic.AddInt64(&nalCountAtomic, 1)
+		newTotalBytes := atomic.AddInt64(&totalBytesAtomic, int64(nalLen))
 
 		// Signal that first NAL was received (enables data channel)
-		if nalCount == 1 {
+		if newNALCount == 1 {
 			firstNALOnce.Do(func() {
 				close(firstNALReceived)
 			})
 		}
 
-		if *verbose && nalCount%100 == 0 {
+		if *verbose && newNALCount%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
-			bitrate := float64(totalBytes*8) / elapsed / 1e6
-			log.Printf("Received %d NALs, %.2f MB, %.2f Mbps", nalCount, float64(totalBytes)/1e6, bitrate)
+			bitrate := float64(newTotalBytes*8) / elapsed / 1e6
+			log.Printf("Received %d NALs, %.2f MB, %.2f Mbps", newNALCount, float64(newTotalBytes)/1e6, bitrate)
 		}
 	}
 
@@ -241,10 +266,12 @@ func main() {
 	wg.Wait()
 
 	elapsed := time.Since(startTime)
-	log.Printf("Finished: received %d NALs, %d bytes in %v", nalCount, totalBytes, elapsed)
+	finalNALCount := atomic.LoadInt64(&nalCountAtomic)
+	finalTotalBytes := atomic.LoadInt64(&totalBytesAtomic)
+	log.Printf("Finished: received %d NALs, %d bytes in %v", finalNALCount, finalTotalBytes, elapsed)
 
-	if totalBytes > 0 && elapsed.Seconds() > 0 {
-		bitrate := float64(totalBytes*8) / elapsed.Seconds() / 1e6
+	if finalTotalBytes > 0 && elapsed.Seconds() > 0 {
+		bitrate := float64(finalTotalBytes*8) / elapsed.Seconds() / 1e6
 		log.Printf("Average bitrate: %.2f Mbps", bitrate)
 	}
 

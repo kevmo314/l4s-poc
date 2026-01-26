@@ -5,12 +5,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,6 +21,41 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 )
+
+// BandwidthStats is received from the receiver over the datachannel
+type BandwidthStats struct {
+	Seq         uint64  `json:"seq"`     // Sequence number for loss/reorder detection
+	Timestamp   int64   `json:"ts"`      // Unix timestamp in ms (for latency measurement)
+	BytesRecv   int64   `json:"bytes"`   // Total bytes received
+	BitrateKbps float64 `json:"kbps"`    // Current bitrate in kbps
+	BitrateMbps float64 `json:"mbps"`    // Current bitrate in Mbps
+	NALCount    int     `json:"nals"`    // Total NALs received
+	ElapsedMs   int64   `json:"elapsed"` // Elapsed time in ms
+}
+
+// Summary is the final stats output to stdout as JSON
+type Summary struct {
+	// Sender stats
+	SenderNALs      int     `json:"sender_nals"`
+	SenderBytes     int64   `json:"sender_bytes"`
+	SenderBitrate   float64 `json:"sender_mbps"`
+	SenderElapsedMs int64   `json:"sender_elapsed_ms"`
+
+	// Receiver stats (from datachannel)
+	ReceiverNALs    int     `json:"receiver_nals"`
+	ReceiverBytes   int64   `json:"receiver_bytes"`
+	ReceiverBitrate float64 `json:"receiver_mbps"`
+
+	// Latency stats (ms)
+	LatencyAvg     float64 `json:"latency_avg_ms"`
+	LatencyMin     int64   `json:"latency_min_ms"`
+	LatencyMax     int64   `json:"latency_max_ms"`
+	LatencySamples int64   `json:"latency_samples"`
+
+	// Packet stats
+	PacketsLost      int64 `json:"packets_lost"`
+	PacketsReordered int64 `json:"packets_reordered"`
+}
 
 func main() {
 	whipURL := flag.String("whip-url", "http://127.0.0.1:8080/whip", "WHIP endpoint URL")
@@ -120,6 +157,19 @@ func main() {
 		log.Fatalf("Failed to create dummy data channel: %v", err)
 	}
 
+	// Store last received bandwidth stats from receiver
+	var lastRecvStats BandwidthStats
+	var lastRecvStatsMu sync.Mutex
+
+	// Latency tracking (note: one-way latency may be negative due to clock skew)
+	var latencySum int64   // sum of all latencies in ms
+	var latencyCount int64 // number of latency samples
+	var latencyMin int64 = 999999999
+	var latencyMax int64 = -999999999
+	var lastSeq uint64      // for detecting packet loss
+	var packetsLost int64   // count of lost packets
+	var packetsReordered int64
+
 	// Handle incoming DataChannel from receiver (side channel)
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		log.Printf("OnDataChannel called: label='%s', id=%d", dc.Label(), dc.ID())
@@ -131,11 +181,45 @@ func main() {
 		})
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			os.Stdout.Write(msg.Data)
-			newBytes := atomic.AddInt64(&dataChannelBytesRecv, int64(len(msg.Data)))
+			recvTime := time.Now().UnixMilli()
+			atomic.AddInt64(&dataChannelBytesRecv, int64(len(msg.Data)))
 			newCount := atomic.AddInt64(&dataChannelMsgCount, 1)
-			if *verbose && newCount%10 == 1 {
-				log.Printf("DataChannel recv: msg #%d, %d bytes (total: %d bytes)", newCount, len(msg.Data), newBytes)
+
+			// Parse bandwidth stats from receiver
+			var stats BandwidthStats
+			if err := json.Unmarshal(msg.Data, &stats); err == nil {
+				lastRecvStatsMu.Lock()
+				lastRecvStats = stats
+
+				// Calculate one-way latency (may be negative due to clock skew)
+				latency := recvTime - stats.Timestamp
+				latencySum += latency
+				latencyCount++
+				if latency < latencyMin {
+					latencyMin = latency
+				}
+				if latency > latencyMax {
+					latencyMax = latency
+				}
+
+				// Check for packet loss/reordering
+				if stats.Seq > 0 {
+					if lastSeq > 0 {
+						if stats.Seq > lastSeq+1 {
+							packetsLost += int64(stats.Seq - lastSeq - 1)
+						} else if stats.Seq <= lastSeq {
+							packetsReordered++
+						}
+					}
+					lastSeq = stats.Seq
+				}
+				lastRecvStatsMu.Unlock()
+
+				if *verbose && newCount%100 == 1 {
+					avgLatency := float64(latencySum) / float64(latencyCount)
+					log.Printf("Receiver: %.2f Mbps | Latency: %.1fms avg, %dms min, %dms max | Lost: %d, Reorder: %d",
+						stats.BitrateMbps, avgLatency, latencyMin, latencyMax, packetsLost, packetsReordered)
+				}
 			}
 		})
 
@@ -377,9 +461,11 @@ finish:
 	close(statsStop)
 	elapsed := time.Since(startTime)
 	log.Printf("Finished: sent %d NALs, %d bytes in %v", nalCount, totalBytes, elapsed)
+
+	var senderBitrate float64
 	if totalBytes > 0 && elapsed.Seconds() > 0 {
-		bitrate := float64(totalBytes*8) / elapsed.Seconds() / 1e6
-		log.Printf("Average bitrate: %.2f Mbps", bitrate)
+		senderBitrate = float64(totalBytes*8) / elapsed.Seconds() / 1e6
+		log.Printf("Average bitrate: %.2f Mbps", senderBitrate)
 	}
 
 	// Wait for data channel with timeout
@@ -397,17 +483,53 @@ finish:
 		}
 	}
 
-	// Print data channel stats
-	dcBytes := atomic.LoadInt64(&dataChannelBytesRecv)
+	// Build and output summary
+	lastRecvStatsMu.Lock()
+	finalStats := lastRecvStats
+	finalLatencyCount := latencyCount
+	finalLatencySum := latencySum
+	finalLatencyMin := latencyMin
+	finalLatencyMax := latencyMax
+	finalPacketsLost := packetsLost
+	finalPacketsReordered := packetsReordered
+	lastRecvStatsMu.Unlock()
+
+	var avgLatency float64
+	if finalLatencyCount > 0 {
+		avgLatency = float64(finalLatencySum) / float64(finalLatencyCount)
+	}
+
+	summary := Summary{
+		SenderNALs:       nalCount,
+		SenderBytes:      totalBytes,
+		SenderBitrate:    senderBitrate,
+		SenderElapsedMs:  elapsed.Milliseconds(),
+		ReceiverNALs:     finalStats.NALCount,
+		ReceiverBytes:    finalStats.BytesRecv,
+		ReceiverBitrate:  finalStats.BitrateMbps,
+		LatencyAvg:       avgLatency,
+		LatencyMin:       finalLatencyMin,
+		LatencyMax:       finalLatencyMax,
+		LatencySamples:   finalLatencyCount,
+		PacketsLost:      finalPacketsLost,
+		PacketsReordered: finalPacketsReordered,
+	}
+
+	// Output JSON summary to stdout
+	if err := json.NewEncoder(os.Stdout).Encode(summary); err != nil {
+		log.Printf("Error encoding summary: %v", err)
+	}
+
+	// Also log to stderr for visibility
 	dcCount := atomic.LoadInt64(&dataChannelMsgCount)
 	if dcCount > 0 {
-		log.Printf("Data channel: received %d messages, %d bytes", dcCount, dcBytes)
-		dcElapsed := time.Since(dataChannelStartTime)
-		if dcElapsed.Seconds() > 0 {
-			dcBitrate := float64(dcBytes*8) / dcElapsed.Seconds() / 1e3
-			log.Printf("Data channel bitrate: %.2f kbps", dcBitrate)
+		if finalStats.BytesRecv > 0 {
+			log.Printf("Receiver reported: %.2f Mbps (%d NALs, %d bytes)",
+				finalStats.BitrateMbps, finalStats.NALCount, finalStats.BytesRecv)
 		}
-	} else {
-		log.Printf("Data channel: no messages received")
+		if finalLatencyCount > 0 {
+			log.Printf("Latency: %.1fms avg, %dms min, %dms max (%d samples)",
+				avgLatency, finalLatencyMin, finalLatencyMax, finalLatencyCount)
+		}
 	}
 }

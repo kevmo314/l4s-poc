@@ -5,7 +5,7 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
@@ -22,6 +22,17 @@ import (
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 )
+
+// BandwidthStats is sent over the datachannel to report receiver bandwidth
+type BandwidthStats struct {
+	Seq         uint64  `json:"seq"`     // Sequence number for loss/reorder detection
+	Timestamp   int64   `json:"ts"`      // Unix timestamp in ms (for latency measurement)
+	BytesRecv   int64   `json:"bytes"`   // Total bytes received
+	BitrateKbps float64 `json:"kbps"`    // Current bitrate in kbps
+	BitrateMbps float64 `json:"mbps"`    // Current bitrate in Mbps
+	NALCount    int     `json:"nals"`    // Total NALs received
+	ElapsedMs   int64   `json:"elapsed"` // Elapsed time in ms
+}
 
 // getGCPExternalIP queries the GCP metadata server for the instance's external IP
 func getGCPExternalIP() string {
@@ -58,7 +69,6 @@ func main() {
 	httpAddr := flag.String("http-addr", ":8080", "HTTP address for WHIP endpoint")
 	whipPath := flag.String("whip-path", "/whip", "WHIP endpoint path")
 	nat1to1IP := flag.String("nat-1to1-ip", "", "Public IP for 1:1 NAT mapping (auto-detects GCP if empty)")
-	dcBitrate := flag.Int("dc-bitrate", 100, "DataChannel send bitrate in kbps (0 to disable)")
 	verbose := flag.Bool("v", false, "Verbose output")
 	flag.Parse()
 
@@ -174,48 +184,66 @@ func main() {
 
 		dc.OnOpen(func() {
 			if *verbose {
-				log.Println("DataChannel opened, starting data sender")
+				log.Println("DataChannel opened, starting stats sender")
 			}
 
-			if *dcBitrate <= 0 {
-				if *verbose {
-					log.Println("DataChannel bitrate is 0, not sending data")
-				}
-				return
-			}
-
-			// Send random data at consistent bitrate
+			// Send bandwidth stats every 10ms for latency measurement
 			go func() {
-				// Send every 100ms (10 times per second)
-				interval := 100 * time.Millisecond
-				bytesPerInterval := (*dcBitrate * 1000 / 8) / 10 // kbps to bytes per 100ms
-
-				buf := make([]byte, bytesPerInterval)
+				interval := 10 * time.Millisecond
 				ticker := time.NewTicker(interval)
 				defer ticker.Stop()
 
+				var seq uint64
+
 				if *verbose {
-					log.Printf("DataChannel sending %d bytes every %v (%d kbps)", bytesPerInterval, interval, *dcBitrate)
+					log.Printf("DataChannel sending bandwidth stats every %v", interval)
 				}
 
 				for range ticker.C {
-					// Fill with random data
-					if _, err := rand.Read(buf); err != nil {
-						log.Printf("Error generating random data: %v", err)
-						break
+					seq++
+
+					// Get current stats
+					statsMu.Lock()
+					currentBytes := totalBytes
+					currentNALs := nalCount
+					var elapsedMs int64
+					var bitrateMbps float64
+					if !firstPacket {
+						elapsed := time.Since(startTime)
+						elapsedMs = elapsed.Milliseconds()
+						if elapsed.Seconds() > 0 {
+							bitrateMbps = float64(currentBytes*8) / elapsed.Seconds() / 1e6
+						}
+					}
+					statsMu.Unlock()
+
+					stats := BandwidthStats{
+						Seq:         seq,
+						Timestamp:   time.Now().UnixMilli(),
+						BytesRecv:   currentBytes,
+						BitrateKbps: bitrateMbps * 1000,
+						BitrateMbps: bitrateMbps,
+						NALCount:    currentNALs,
+						ElapsedMs:   elapsedMs,
 					}
 
-					if err := dc.Send(buf); err != nil {
+					data, err := json.Marshal(stats)
+					if err != nil {
+						log.Printf("Error marshaling stats: %v", err)
+						continue
+					}
+
+					if err := dc.Send(data); err != nil {
 						if *verbose {
 							log.Printf("Error sending on DataChannel: %v", err)
 						}
 						break
 					}
-					atomic.AddInt64(&dataChannelBytesSent, int64(len(buf)))
+					atomic.AddInt64(&dataChannelBytesSent, int64(len(data)))
 					atomic.AddInt64(&dataChannelMsgCount, 1)
 				}
 				if *verbose {
-					log.Printf("Data sender finished: sent %d messages, %d bytes",
+					log.Printf("Stats sender finished: sent %d messages, %d bytes",
 						atomic.LoadInt64(&dataChannelMsgCount), atomic.LoadInt64(&dataChannelBytesSent))
 				}
 			}()
