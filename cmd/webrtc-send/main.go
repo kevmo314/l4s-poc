@@ -36,15 +36,16 @@ type BandwidthStats struct {
 // Summary is the final stats output to stdout as JSON
 type Summary struct {
 	// Sender stats
-	SenderNALs      int     `json:"sender_nals"`
 	SenderBytes     int64   `json:"sender_bytes"`
 	SenderBitrate   float64 `json:"sender_mbps"`
 	SenderElapsedMs int64   `json:"sender_elapsed_ms"`
 
 	// Receiver stats (from datachannel)
-	ReceiverNALs    int     `json:"receiver_nals"`
 	ReceiverBytes   int64   `json:"receiver_bytes"`
 	ReceiverBitrate float64 `json:"receiver_mbps"`
+
+	// DataChannel stats (return path from receiver)
+	DataChannelMbps float64 `json:"datachannel_mbps"`
 
 	// Latency stats (ms)
 	LatencyAvg     float64 `json:"latency_avg_ms"`
@@ -373,28 +374,80 @@ func main() {
 		return
 	}
 
-	// Start datachannel stats logger
+	// Sender stats (use atomics for goroutine access)
+	var senderNALCount int64
+	var senderTotalBytes int64
+	senderStartTime := time.Now()
+
+	// Start periodic JSON output (every 1s to stdout)
 	statsStop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		var lastBytes int64
+
 		for {
 			select {
 			case <-statsStop:
 				return
 			case <-ticker.C:
-				if atomic.LoadInt32(&dataChannelOpen) == 1 {
-					currentBytes := atomic.LoadInt64(&dataChannelBytesRecv)
+				if atomic.LoadInt32(&dataChannelOpen) != 1 {
+					continue
+				}
+
+				// Get sender stats
+				curBytes := atomic.LoadInt64(&senderTotalBytes)
+				senderElapsed := time.Since(senderStartTime)
+				var senderMbps float64
+				if senderElapsed.Seconds() > 0 {
+					senderMbps = float64(curBytes*8) / senderElapsed.Seconds() / 1e6
+				}
+
+				// Get receiver stats
+				lastRecvStatsMu.Lock()
+				recvStats := lastRecvStats
+				latCount := latencyCount
+				latSum := latencySum
+				latMin := latencyMin
+				latMax := latencyMax
+				pktLost := packetsLost
+				pktReorder := packetsReordered
+				lastRecvStatsMu.Unlock()
+
+				var avgLat float64
+				if latCount > 0 {
+					avgLat = float64(latSum) / float64(latCount)
+				}
+
+				// Calculate datachannel bitrate
+				dcBytes := atomic.LoadInt64(&dataChannelBytesRecv)
+				dcElapsed := time.Since(dataChannelStartTime).Seconds()
+				var dcMbps float64
+				if dcElapsed > 0 {
+					dcMbps = float64(dcBytes*8) / dcElapsed / 1e6
+				}
+
+				// Output periodic JSON summary
+				summary := Summary{
+					SenderBytes:      curBytes,
+					SenderBitrate:    senderMbps,
+					SenderElapsedMs:  senderElapsed.Milliseconds(),
+					ReceiverBytes:    recvStats.BytesRecv,
+					ReceiverBitrate:  recvStats.BitrateMbps,
+					DataChannelMbps:  dcMbps,
+					LatencyAvg:       avgLat,
+					LatencyMin:       latMin,
+					LatencyMax:       latMax,
+					LatencySamples:   latCount,
+					PacketsLost:      pktLost,
+					PacketsReordered: pktReorder,
+				}
+				json.NewEncoder(os.Stdout).Encode(summary)
+
+				// Also log to stderr if verbose
+				if *verbose {
 					currentCount := atomic.LoadInt64(&dataChannelMsgCount)
-					elapsed := time.Since(dataChannelStartTime).Seconds()
-					instantBitrate := float64(currentBytes-lastBytes) * 8 / 1e3 // kbps in last second
-					avgBitrate := float64(currentBytes*8) / elapsed / 1e3       // kbps average
-					if *verbose {
-						log.Printf("DataChannel: %d msgs, %d bytes, instant=%.1f kbps, avg=%.1f kbps",
-							currentCount, currentBytes, instantBitrate, avgBitrate)
-					}
-					lastBytes = currentBytes
+					log.Printf("DataChannel: %d msgs, %d bytes, avg=%.3f Mbps",
+						currentCount, dcBytes, dcMbps)
 				}
 			}
 		}
@@ -403,10 +456,6 @@ func main() {
 	// Read H264 NAL units from stdin and send them
 	reader := h264.NewAnnexBReader(os.Stdin)
 	packetizer := h264.NewRTPPacketizer(0x12345678, 1200)
-
-	nalCount := 0
-	totalBytes := int64(0)
-	startTime := time.Now()
 
 	// Frame duration in ms
 	frameDurationMs := uint32(1000 / *framerate)
@@ -441,11 +490,13 @@ func main() {
 			}
 		}
 
-		nalCount++
-		totalBytes += int64(len(nal.Data))
+		atomic.AddInt64(&senderNALCount, 1)
+		atomic.AddInt64(&senderTotalBytes, int64(len(nal.Data)))
 
+		nalCount := atomic.LoadInt64(&senderNALCount)
 		if *verbose && nalCount%100 == 0 {
-			elapsed := time.Since(startTime).Seconds()
+			totalBytes := atomic.LoadInt64(&senderTotalBytes)
+			elapsed := time.Since(senderStartTime).Seconds()
 			bitrate := float64(totalBytes*8) / elapsed / 1e6
 			log.Printf("Sent %d NALs, %.2f MB, %.2f Mbps", nalCount, float64(totalBytes)/1e6, bitrate)
 		}
@@ -458,8 +509,9 @@ func main() {
 	}
 
 finish:
-	close(statsStop)
-	elapsed := time.Since(startTime)
+	nalCount := atomic.LoadInt64(&senderNALCount)
+	totalBytes := atomic.LoadInt64(&senderTotalBytes)
+	elapsed := time.Since(senderStartTime)
 	log.Printf("Finished: sent %d NALs, %d bytes in %v", nalCount, totalBytes, elapsed)
 
 	var senderBitrate float64
@@ -483,6 +535,9 @@ finish:
 		}
 	}
 
+	// Stop periodic JSON output
+	close(statsStop)
+
 	// Build and output summary
 	lastRecvStatsMu.Lock()
 	finalStats := lastRecvStats
@@ -499,14 +554,21 @@ finish:
 		avgLatency = float64(finalLatencySum) / float64(finalLatencyCount)
 	}
 
+	// Calculate final datachannel bitrate
+	finalDcBytes := atomic.LoadInt64(&dataChannelBytesRecv)
+	finalDcElapsed := time.Since(dataChannelStartTime).Seconds()
+	var finalDcMbps float64
+	if finalDcElapsed > 0 {
+		finalDcMbps = float64(finalDcBytes*8) / finalDcElapsed / 1e6
+	}
+
 	summary := Summary{
-		SenderNALs:       nalCount,
 		SenderBytes:      totalBytes,
 		SenderBitrate:    senderBitrate,
 		SenderElapsedMs:  elapsed.Milliseconds(),
-		ReceiverNALs:     finalStats.NALCount,
 		ReceiverBytes:    finalStats.BytesRecv,
 		ReceiverBitrate:  finalStats.BitrateMbps,
+		DataChannelMbps:  finalDcMbps,
 		LatencyAvg:       avgLatency,
 		LatencyMin:       finalLatencyMin,
 		LatencyMax:       finalLatencyMax,
