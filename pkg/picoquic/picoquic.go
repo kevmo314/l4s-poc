@@ -148,6 +148,15 @@ func (c *Connection) FinishStream() error {
 	return nil
 }
 
+// WaitStreamComplete waits for all stream data to be acknowledged.
+// Should be called after FinishStream to ensure all data is delivered.
+func (c *Connection) WaitStreamComplete(timeoutMs int) error {
+	if C.pq_wait_stream_complete(c.conn, C.int(timeoutMs)) != 0 {
+		return errors.New("timeout waiting for stream to complete")
+	}
+	return nil
+}
+
 // Read reads data from stream 0.
 func (c *Connection) Read(buffer []byte) (int, error) {
 	if len(buffer) == 0 {

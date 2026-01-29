@@ -37,6 +37,10 @@ int pq_send_stream(pq_connection_t* conn, const uint8_t* data, size_t len);
 // Finish stream 0 (send FIN, no more data)
 int pq_finish_stream(pq_connection_t* conn);
 
+// Wait for stream 0 to be fully sent and acknowledged (call after finish_stream)
+// Returns 0 on success, -1 on error/timeout
+int pq_wait_stream_complete(pq_connection_t* conn, int timeout_ms);
+
 // Receive data from stream 0 (blocking, returns bytes received, -1 on error)
 int pq_recv_stream(pq_connection_t* conn, uint8_t* buffer, size_t buffer_size);
 

@@ -19,6 +19,8 @@ import (
 
 	"github.com/kevmo314/l4s/pkg/h264"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -67,6 +69,7 @@ func main() {
 	turnServer := flag.String("turn-server", "", "TURN server URL (e.g., turn:turn.example.com:3478)")
 	turnUser := flag.String("turn-user", "", "TURN server username")
 	turnPass := flag.String("turn-pass", "", "TURN server password")
+	initialBitrate := flag.Int("bitrate", 20_000_000, "Initial target bitrate in bps for congestion control")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -88,10 +91,33 @@ func main() {
 		log.Fatalf("Failed to register codec: %v", err)
 	}
 
-	// Create interceptor registry
+	// Create interceptor registry with GCC for sender-side congestion control
 	i := &interceptor.Registry{}
+
+	// Add Google Congestion Controller for sender-side bandwidth estimation and pacing
+	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		return gcc.NewSendSideBWE(
+			gcc.SendSideBWEInitialBitrate(*initialBitrate),
+			gcc.SendSideBWEMaxBitrate(100_000_000), // 100 Mbps max
+			gcc.SendSideBWEMinBitrate(100_000),     // 100 Kbps min
+		)
+	})
+	if err != nil {
+		log.Fatalf("Failed to create congestion controller: %v", err)
+	}
+	i.Add(congestionController)
+
+	// Configure TWCC sender for congestion control feedback
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
+		log.Fatalf("Failed to configure TWCC: %v", err)
+	}
+
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 		log.Fatalf("Failed to register interceptors: %v", err)
+	}
+
+	if *verbose {
+		log.Printf("Congestion control enabled with initial bitrate %d bps", *initialBitrate)
 	}
 
 	// Create setting engine for NAT configuration

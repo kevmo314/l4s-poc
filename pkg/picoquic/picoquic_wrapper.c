@@ -289,11 +289,30 @@ static int stream_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* byt
             }
             break;
 
-        case picoquic_callback_ready:
+        case picoquic_callback_ready: {
             fprintf(stderr, "DEBUG: Connection ready!\n");
             conn->handshake_done = 1;
             conn->is_connected = 1;
+            // Log congestion and ECN state
+            picoquic_path_t* path = cnx->path[0];
+            if (path) {
+                fprintf(stderr, "DEBUG: CC - cwin=%lu, rtt=%lu us\n",
+                    (unsigned long)path->cwin, (unsigned long)path->smoothed_rtt);
+                // ECN counters are in ack_context
+                picoquic_ack_context_t* ack_ctx = &cnx->ack_ctx[0];
+                fprintf(stderr, "DEBUG: ECN local - ect0=%lu, ect1=%lu, ce=%lu, sending_ecn_ack=%d\n",
+                    (unsigned long)ack_ctx->ecn_ect0_total_local,
+                    (unsigned long)ack_ctx->ecn_ect1_total_local,
+                    (unsigned long)ack_ctx->ecn_ce_total_local,
+                    (int)ack_ctx->sending_ecn_ack);
+                picoquic_packet_context_t* pkt_ctx = &cnx->pkt_ctx[0];
+                fprintf(stderr, "DEBUG: ECN remote - ect0=%lu, ect1=%lu, ce=%lu\n",
+                    (unsigned long)pkt_ctx->ecn_ect0_total_remote,
+                    (unsigned long)pkt_ctx->ecn_ect1_total_remote,
+                    (unsigned long)pkt_ctx->ecn_ce_total_remote);
+            }
             break;
+        }
 
         case picoquic_callback_request_alpn_list:
             // Client side: add our ALPN to the list
@@ -344,6 +363,26 @@ static int loop_callback(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_
             break;
 
         case picoquic_packet_loop_wake_up:
+            // Log CC state periodically
+            if (ctx->client_conn && ctx->client_conn->cnx) {
+                static uint64_t last_cc_log = 0;
+                uint64_t now = picoquic_current_time();
+                if (now - last_cc_log > 1000000) {  // Every 1 second
+                    picoquic_path_t* p = ctx->client_conn->cnx->path[0];
+                    if (p) {
+                        picoquic_packet_context_t* pkt_ctx = &ctx->client_conn->cnx->pkt_ctx[0];
+                    fprintf(stderr, "DEBUG: CC state - cwin=%lu, bytes_in_transit=%lu, rtt=%lu us, mtu=%lu, send_seq=%lu, ect1_remote=%lu, ce_remote=%lu\n",
+                            (unsigned long)p->cwin,
+                            (unsigned long)p->bytes_in_transit,
+                            (unsigned long)p->smoothed_rtt,
+                            (unsigned long)p->send_mtu,
+                            (unsigned long)pkt_ctx->send_sequence,
+                            (unsigned long)pkt_ctx->ecn_ect1_total_remote,
+                            (unsigned long)pkt_ctx->ecn_ce_total_remote);
+                    }
+                    last_cc_log = now;
+                }
+            }
             // Process any pending sends for client connection
             if (ctx->client_conn) {
                 process_send_queue(ctx->client_conn);
@@ -420,7 +459,17 @@ static int loop_callback(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_
     return 0;
 }
 
+// Declared in register_all_cc_algorithms.c
+extern void picoquic_register_all_congestion_control_algorithms();
+
 pq_context_t* pq_create_context(int is_server, const char* cert_file, const char* key_file) {
+    // Register all CC algorithms so picoquic_set_default_congestion_algorithm_by_name works
+    static int cc_registered = 0;
+    if (!cc_registered) {
+        picoquic_register_all_congestion_control_algorithms();
+        cc_registered = 1;
+    }
+
     pq_context_t* ctx = calloc(1, sizeof(pq_context_t));
     if (!ctx) return NULL;
 
@@ -472,6 +521,12 @@ int pq_listen(pq_context_t* ctx, uint16_t port) {
     // This ensures the server advertises datagram support in its transport parameters
     ctx->quic->default_tp.max_datagram_frame_size = PICOQUIC_MAX_PACKET_SIZE;
     fprintf(stderr, "DEBUG: Enabled default datagram support on server (max_datagram_frame_size=%d)\n", PICOQUIC_MAX_PACKET_SIZE);
+
+    // Increase flow control limits for high-bandwidth streams
+    ctx->quic->default_tp.initial_max_data = 16 * 1024 * 1024;  // 16MB connection-level
+    ctx->quic->default_tp.initial_max_stream_data_bidi_local = 8 * 1024 * 1024;  // 8MB per stream
+    ctx->quic->default_tp.initial_max_stream_data_bidi_remote = 8 * 1024 * 1024;  // 8MB per stream
+    fprintf(stderr, "DEBUG: Set flow control limits: max_data=16MB, max_stream_data=8MB\n");
 
     // Start the network thread
     picoquic_packet_loop_param_t param = {0};
@@ -544,13 +599,17 @@ pq_connection_t* pq_connect(pq_context_t* ctx, const char* server_name, uint16_t
     }
     fprintf(stderr, "DEBUG: Connection created\n");
 
-    // Enable datagram support on client
+    // Enable datagram support and increase flow control limits on client
     picoquic_tp_t const* tp = picoquic_get_transport_parameters(cnx, 1); // get local
     if (tp) {
         picoquic_tp_t tp_copy = *tp;
         tp_copy.max_datagram_frame_size = 1500; // Enable datagrams
+        // Increase flow control limits for high-bandwidth streams
+        tp_copy.initial_max_data = 16 * 1024 * 1024;  // 16MB connection-level
+        tp_copy.initial_max_stream_data_bidi_local = 8 * 1024 * 1024;  // 8MB per stream
+        tp_copy.initial_max_stream_data_bidi_remote = 8 * 1024 * 1024;  // 8MB per stream
         picoquic_set_transport_parameters(cnx, &tp_copy);
-        fprintf(stderr, "DEBUG: Enabled datagram support (max_datagram_frame_size=1500)\n");
+        fprintf(stderr, "DEBUG: Enabled datagram support and flow control (max_datagram=1500, max_stream_data=8MB)\n");
     }
 
     pq_connection_t* conn = create_connection(ctx, cnx);
@@ -661,6 +720,43 @@ int pq_finish_stream(pq_connection_t* conn) {
     }
 
     return 0;
+}
+
+int pq_wait_stream_complete(pq_connection_t* conn, int timeout_ms) {
+    if (!conn || conn->is_closed) return -1;
+
+    // Wait for send queue to drain and connection to be idle
+    int waited = 0;
+    while (waited < timeout_ms) {
+        pthread_mutex_lock(&conn->send_lock);
+        int queue_empty = (conn->send_head == NULL);
+        pthread_mutex_unlock(&conn->send_lock);
+
+        if (queue_empty && conn->cnx) {
+            // Check if all data has been acknowledged
+            picoquic_state_enum state = picoquic_get_cnx_state(conn->cnx);
+            if (state >= picoquic_state_disconnecting || conn->is_closed) {
+                return 0;  // Connection closing/closed, data should be sent
+            }
+            // Give it a bit more time for final ACKs
+            if (queue_empty) {
+                usleep(10000);  // 10ms
+                waited += 10;
+                if (waited >= 100) {  // After 100ms with empty queue, assume complete
+                    return 0;
+                }
+            }
+        } else {
+            usleep(10000);  // 10ms
+            waited += 10;
+        }
+
+        if (conn->is_closed) {
+            return 0;
+        }
+    }
+
+    return -1;  // Timeout
 }
 
 int pq_recv_stream(pq_connection_t* conn, uint8_t* buffer, size_t buffer_size) {

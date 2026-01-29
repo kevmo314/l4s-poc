@@ -338,6 +338,16 @@ func main() {
 		log.Println("Sent stream FIN")
 	}
 
+	// Wait for all data to be acknowledged (up to 30 seconds)
+	if *verbose {
+		log.Println("Waiting for stream data to be acknowledged...")
+	}
+	if err := conn.WaitStreamComplete(30000); err != nil {
+		log.Printf("Warning: stream completion wait: %v", err)
+	} else if *verbose {
+		log.Println("All stream data acknowledged")
+	}
+
 	nalCount := atomic.LoadInt64(&senderNALCount)
 	totalBytes := atomic.LoadInt64(&senderTotalBytes)
 	elapsed := time.Since(senderStartTime)

@@ -87,20 +87,19 @@ func main() {
 		log.Printf("Starting WebRTC receiver on %s%s", *httpAddr, *whipPath)
 	}
 
-	// Track received statistics
-	var (
-		nalCount    int
-		totalBytes  int64
-		startTime   time.Time
-		statsMu     sync.Mutex
-		firstPacket bool = true
-	)
-
 	// Output writer (stdout)
 	writer := h264.NewAnnexBWriter(os.Stdout)
 
 	// Create HTTP server with WHIP endpoint
 	http.HandleFunc(*whipPath, func(w http.ResponseWriter, r *http.Request) {
+		// Reset stats for each new connection
+		var (
+			nalCount    int
+			totalBytes  int64
+			startTime   time.Time
+			statsMu     sync.Mutex
+			firstPacket bool = true
+		)
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
